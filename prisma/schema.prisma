@@ -1,0 +1,106 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Vendor {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  vendor_ref String?  @unique
+  name       String
+  tax_number String?
+  email      String?
+  phone      String?
+  website    String?
+  address    Json?
+  invoices   Invoice[] @relation("VendorInvoices")
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("vendors")
+}
+
+model Customer {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customer_ref String?  @unique
+  name         String
+  email        String?
+  phone        String?
+  address      Json?
+  invoices     Invoice[] @relation("CustomerInvoices")
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  @@map("customers")
+}
+
+model Category {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+  items InvoiceLineItem[]
+
+  @@map("categories")
+}
+
+model Invoice {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid @map("id")
+  invoice_number String?  @map("invoice_number")
+  invoice_ref    String?  @unique @map("invoice_ref")
+  vendorId       String?  @db.Uuid @map("vendor_id")
+  customerId     String?  @db.Uuid @map("customer_id")
+  vendor         Vendor?  @relation(fields: [vendorId], references: [id], name: "VendorInvoices")
+  customer       Customer?@relation(fields: [customerId], references: [id], name: "CustomerInvoices")
+  issue_date     DateTime? @map("issue_date")
+  due_date       DateTime? @map("due_date")
+  currency       String?   @map("currency")
+  subtotal       Decimal? @db.Decimal(65,30) @map("subtotal")
+  tax            Decimal? @db.Decimal(65,30) @map("tax")
+  total          Decimal? @db.Decimal(65,30) @map("total")
+  status         String?   @map("status")
+  notes          String?   @map("notes")
+  raw            Json?     @map("raw")
+  line_items     InvoiceLineItem[]
+  payments       Payment[]
+  created_at     DateTime  @default(now()) @map("created_at")
+  updated_at     DateTime  @updatedAt      @map("updated_at")
+
+  @@map("invoices")
+}
+
+
+model InvoiceLineItem {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid @map("id")
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id])
+  invoiceId   String   @db.Uuid @map("invoice_id")
+  line_index  Int?     @map("line_index")
+  description String?  @map("description")
+  sku         String?  @map("sku")
+  quantity    Decimal? @db.Decimal(65,30) @map("quantity")
+  unit_price  Decimal? @db.Decimal(65,30) @map("unit_price")
+  tax_amount  Decimal? @db.Decimal(65,30) @map("tax_amount")
+  amount      Decimal? @db.Decimal(65,30) @map("amount")
+  categoryId  Int?     @map("category_id")
+  category    Category? @relation(fields: [categoryId], references: [id])
+  metadata    Json?    @map("metadata")
+  created_at  DateTime @default(now()) @map("created_at")
+
+  @@map("invoice_line_items")
+}
+
+
+model Payment {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid @map("id")
+  invoice    Invoice @relation(fields: [invoiceId], references: [id])
+  invoiceId  String  @db.Uuid @map("invoice_id")
+  amount     Decimal @db.Decimal(14,2) @map("amount")
+  paid_at    DateTime? @map("paid_at")
+  method     String? @map("method")
+  reference  String? @map("reference")
+  raw        Json?   @map("raw")
+  created_at DateTime @default(now()) @map("created_at")
+
+  @@map("payments")
+}

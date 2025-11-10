@@ -1,0 +1,278 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from groq import Groq
+import json
+
+# Load .env file from the service directory
+# Try multiple paths to ensure we find the .env file
+env_paths = [
+    Path(__file__).parent / '.env',  # Relative to this file
+    Path('.env'),  # Current working directory
+    Path(__file__).parent.parent.parent / 'services' / 'vanna' / '.env',  # Absolute from root
+]
+
+env_loaded = False
+for env_path in env_paths:
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=True)
+        env_loaded = True
+        print(f"Loaded .env from: {env_path.absolute()}")
+        break
+
+if not env_loaded:
+    print(f"Warning: Could not find .env file. Tried paths: {[str(p) for p in env_paths]}")
+    # Fallback: try loading from current directory
+    load_dotenv(override=True)
+
+app = FastAPI(title="Vanna AI Service")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Groq client (optional - service will run but chat will fail without it)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+groq_client = None
+if GROQ_API_KEY:
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        print(f"Warning: Could not initialize Groq client: {e}")
+        print("Service will run but chat endpoint will not work without valid GROQ_API_KEY")
+else:
+    print("Warning: GROQ_API_KEY not set. Chat endpoint will not work.")
+    print("Set GROQ_API_KEY in .env file to enable chat functionality.")
+
+# Database connection (optional - will fail when trying to connect if not set)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    print("Warning: DATABASE_URL not set. Database operations will fail.")
+    print("Set DATABASE_URL in .env file to enable database functionality.")
+
+def get_db_connection():
+    """Get database connection"""
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set. Please set it in your .env file.")
+    # Parse DATABASE_URL - remove any SQLAlchemy-style prefixes
+    # psycopg2 expects: postgresql://user:password@host:port/dbname
+    db_url = DATABASE_URL.replace("postgresql+psycopg2://", "postgresql://")
+    db_url = db_url.replace("postgresql+psycopg://", "postgresql://")
+    return psycopg2.connect(db_url)
+
+
+def get_schema_info():
+    """Get database schema information"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        # Get table information
+        cursor.execute("""
+            SELECT 
+                table_name,
+                column_name,
+                data_type,
+                is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+        """)
+        
+        columns = cursor.fetchall()
+        
+        # Organize by table
+        schema = {}
+        for col in columns:
+            table = col['table_name']
+            if table not in schema:
+                schema[table] = []
+            schema[table].append({
+                'column': col['column_name'],
+                'type': col['data_type'],
+                'nullable': col['is_nullable']
+            })
+        
+        return schema
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def execute_sql(sql: str):
+    """Execute SQL query and return results"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        cursor.execute(sql)
+        if cursor.description:
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        return []
+    except Exception as e:
+        raise Exception(f"SQL execution error: {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+class ChatResponse(BaseModel):
+    response: str
+    sql: str = None
+    data: list = None
+    error: str = None
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/v1/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    try:
+        query = request.message
+        
+        # Check if Groq client is available
+        if not groq_client:
+            return ChatResponse(
+                response="Error: GROQ_API_KEY is not set. Please set GROQ_API_KEY in your .env file to use the chat functionality.",
+                error="GROQ_API_KEY not configured"
+            )
+        
+        # Get database schema
+        schema = get_schema_info()
+        
+        # Create schema description for the LLM
+        schema_description = "Database schema:\n"
+        for table_name, columns in schema.items():
+            schema_description += f"\nTable: {table_name}\n"
+            for col in columns:
+                schema_description += f"  - {col['column']} ({col['type']})\n"
+        
+        # Create prompt for Groq
+        system_prompt = """You are a SQL query generator. Given a natural language question and a database schema, generate a valid PostgreSQL SQL query.
+
+Rules:
+1. Only generate SQL, no explanations
+2. Use proper PostgreSQL syntax
+3. Return only the SQL query, no markdown formatting
+4. Use table and column names exactly as provided in the schema
+5. Be careful with date functions and aggregations
+"""
+        
+        user_prompt = f"""{schema_description}
+
+Question: {query}
+
+Generate a SQL query to answer this question. Return only the SQL query:"""
+        
+        # Call Groq API
+        try:
+            chat_completion = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                model="llama-3.1-8b-instantspecdec",
+                temperature=0.1,
+                max_tokens=1000
+            )
+        except Exception as groq_error:
+            error_msg = str(groq_error)
+            print(f"Groq API error: {error_msg}")
+            return ChatResponse(
+                response=f"Error calling Groq API: {error_msg}. Please check your GROQ_API_KEY in the .env file.",
+                error=error_msg
+            )
+        
+        # Extract SQL from response
+        sql = chat_completion.choices[0].message.content.strip()
+        
+        # Remove markdown code blocks if present
+        if sql.startswith("```sql"):
+            sql = sql[6:]
+        if sql.startswith("```"):
+            sql = sql[3:]
+        if sql.endswith("```"):
+            sql = sql[:-3]
+        sql = sql.strip()
+        
+        # Execute SQL
+        try:
+            data = execute_sql(sql)
+            
+            # Generate natural language response
+            if data:
+                response_prompt = f"""Based on the following SQL query results, provide a clear and concise answer to the question: "{query}"
+
+SQL Query: {sql}
+
+Results: {json.dumps(data[:10], indent=2)}
+
+Provide a natural language answer:"""
+            else:
+                response_prompt = f"""The SQL query returned no results. Provide a helpful response to the question: "{query}"
+
+SQL Query: {sql}
+
+Provide a natural language answer explaining that no data was found:"""
+            
+            response_completion = groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that explains database query results in natural language."},
+                    {"role": "user", "content": response_prompt}
+                ],
+                model="llama-3.1-8b-instantspecdec",
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            response_text = response_completion.choices[0].message.content.strip()
+            
+            return ChatResponse(
+                response=response_text,
+                sql=sql,
+                data=data
+            )
+            
+        except Exception as sql_error:
+            return ChatResponse(
+                response=f"I generated a SQL query, but encountered an error executing it: {str(sql_error)}. The query was: {sql}",
+                sql=sql,
+                error=str(sql_error)
+            )
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/schema")
+async def get_schema():
+    """Get database schema"""
+    try:
+        schema = get_schema_info()
+        return {"schema": schema}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
